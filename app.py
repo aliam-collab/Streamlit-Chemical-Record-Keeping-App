@@ -1,20 +1,22 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import os
 from datetime import datetime
+from io import StringIO
 
-DB = "chemicals.db"
+DB_PATH = "chemicals.db"
 
-# ----------------------------
-# Database Initialization
-# ----------------------------
+# -------------------------
+# Database helpers
+# -------------------------
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
-    conn = sqlite3.connect(DB)
+    conn = get_conn()
     cur = conn.cursor()
 
-    # Chemical master list
+    # chemicals master list (private)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS chemicals (
         serial_no INTEGER,
@@ -24,252 +26,213 @@ def init_db():
         issued_total REAL,
         unit TEXT,
         cas_no TEXT
-    )
-    """)
+    )""")
 
-    # Users database
+    # users (simple registry for audit; roles are chosen at login in this demo)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
-        role TEXT
-    )
-    """)
+        full_name TEXT
+    )""")
 
-    # Requests table
+    # requests made by users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        chemical TEXT,
-        amount REAL,
-        status TEXT,
-        request_time TEXT,
-        approve_time TEXT,
-        issue_time TEXT
+        username TEXT NOT NULL,
+        chemical TEXT NOT NULL,
+        amount REAL NOT NULL,
+        note TEXT,
+        status TEXT NOT NULL DEFAULT 'Pending',   -- Pending / Approved / Rejected / Issued
+        supervisor TEXT,
+        lab_incharge TEXT,
+        created_at TEXT,
+        updated_at TEXT
+    )""")
+
+    # issued records (per user)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS issued (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        chemical TEXT NOT NULL,
+        amount REAL NOT NULL,
+        issued_by TEXT,
+        issued_at TEXT
+    )""")
+
+    # notifications for users / lab / supervisor
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recipient TEXT NOT NULL,
+        message TEXT NOT NULL,
+        seen INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT
+    )""")
+
+    conn.commit()
+    conn.close()
+
+# -------------------------
+# Utility operations
+# -------------------------
+def safe_query_df(query, params=()):
+    conn = get_conn()
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+def push_notification(recipient, message):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO notifications(recipient,message,created_at) VALUES (?,?,?)",
+        (recipient, message, datetime.utcnow().isoformat())
     )
-    """)
-
     conn.commit()
     conn.close()
 
-
-# ----------------------------
-# Helper Functions
-# ----------------------------
-
-def load_chemical_list():
-    conn = sqlite3.connect(DB)
-    df = pd.read_sql_query("SELECT * FROM chemicals", conn)
-    conn.close()
-    return df
-
-def load_requests():
-    conn = sqlite3.connect(DB)
-    df = pd.read_sql_query("SELECT * FROM requests", conn)
-    conn.close()
-    return df
-
-def load_user_requests(username):
-    conn = sqlite3.connect(DB)
-    df = pd.read_sql_query(f"SELECT * FROM requests WHERE username='{username}'", conn)
-    conn.close()
-    return df
-
-def add_request(username, chem, amount):
-    conn = sqlite3.connect(DB)
+def get_unseen_notifications(user):
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO requests (username, chemical, amount, status, request_time)
-        VALUES (?, ?, ?, 'Pending', ?)
-    """, (username, chem, amount, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
+    cur.execute("SELECT id, message, created_at FROM notifications WHERE recipient=? AND seen=0 ORDER BY created_at DESC", (user,))
+    rows = cur.fetchall()
     conn.close()
+    return rows
 
-def approve_request(req_id):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE requests SET status='Approved', approve_time=?
-        WHERE id=?
-    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), req_id))
-    conn.commit()
-    conn.close()
-
-def issue_request(req_id, chem, amount):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-
-    # deduct stock
-    cur.execute("SELECT amount_remaining, issued_total FROM chemicals WHERE chemical=?", (chem,))
-    stock = cur.fetchone()
-
-    if stock:
-        remaining, issued = stock
-        new_remaining = remaining - amount
-        new_issued = issued + amount
-
-        cur.execute("""
-            UPDATE chemicals
-            SET amount_remaining=?, issued_total=?
-            WHERE chemical=?
-        """, (new_remaining, new_issued, chem))
-
-    # update request status
-    cur.execute("""
-        UPDATE requests SET status='Issued', issue_time=?
-        WHERE id=?
-    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), req_id))
-
-    conn.commit()
-    conn.close()
-
-
-# ----------------------------
-# Upload Chemical List
-# ----------------------------
-
-def upload_chemical_list(file):
-    df = pd.read_excel(file)
-
-    # Expected columns
-    df.columns = df.columns.str.strip()
-
-    required_cols = ["S.NO.", "Names", "Quantity", "Units", "Q.Issued", "Q.Remaining", "CAS.No."]
-    if not all(col in df.columns for col in required_cols):
-        st.error("Uploaded sheet does not match required format.")
+def mark_notifications_seen(ids):
+    if not ids:
         return
-
-    conn = sqlite3.connect(DB)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM chemicals")  # delete old list
-
-    for _, row in df.iterrows():
-        cur.execute("""
-        INSERT INTO chemicals (serial_no, chemical, amount_total, unit, issued_total, amount_remaining, cas_no)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            row["S.NO."],
-            row["Names"],
-            row["Quantity"],
-            row["Units"],
-            row["Q.Issued"],
-            row["Q.Remaining"],
-            row["CAS.No."]
-        ))
-
+    cur.executemany("UPDATE notifications SET seen=1 WHERE id=?", [(i,) for i in ids])
     conn.commit()
     conn.close()
-    st.success("Chemical list uploaded successfully.")
 
+# -------------------------
+# Chemical master list ops
+# -------------------------
+def load_chemicals():
+    return safe_query_df("SELECT serial_no,chemical,amount_total,amount_remaining,issued_total,unit,cas_no FROM chemicals ORDER BY serial_no")
 
-# ----------------------------
-# Authentication Mock
-# ----------------------------
+def find_chemical_row(chemical_name):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT serial_no,chemical,amount_total,amount_remaining,issued_total,unit,cas_no FROM chemicals WHERE chemical = ?", (chemical_name,))
+    row = cur.fetchone()
+    conn.close()
+    return row  # None or tuple
 
-def login():
-    st.sidebar.title("Login")
-    username = st.sidebar.text_input("Username")
-    role = st.sidebar.selectbox("Role", ["User", "Supervisor", "Lab Incharge"])
-    if st.sidebar.button("Login"):
-        return username, role
-    return None, None
+def adjust_stock(chemical_name, delta):
+    """
+    delta negative to reduce, positive to add. Returns (ok, message_or_new_remaining)
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT amount_remaining, issued_total FROM chemicals WHERE chemical = ?", (chemical_name,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        return False, "Chemical not found in master list"
+    remaining, issued = r
+    new_remaining = remaining + delta
+    if new_remaining < 0:
+        conn.close()
+        return False, "Insufficient stock"
+    new_issued = issued - delta if delta < 0 else issued  # if reducing stock, issued increases
+    if delta < 0:
+        new_issued = issued + (-delta)
+    cur.execute("UPDATE chemicals SET amount_remaining=?, issued_total=? WHERE chemical=?", (new_remaining, new_issued, chemical_name))
+    conn.commit()
+    conn.close()
+    return True, new_remaining
 
+def upload_master_from_excel(uploaded_file):
+    # read excel and expect the columns given by user: S.NO., Names, Quantity, Units, Q.Issued, Q.Remaining, CAS.No.
+    df = pd.read_excel(uploaded_file)
+    df.columns = df.columns.str.strip()
+    required = ["S.NO.", "Names", "Quantity", "Units", "Q.Issued", "Q.Remaining", "CAS.No."]
+    if not all(col in df.columns for col in required):
+        raise ValueError("Excel must contain columns: " + ", ".join(required))
+    conn = get_conn()
+    cur = conn.cursor()
+    # delete existing master list (user requested ability to permanently replace)
+    cur.execute("DELETE FROM chemicals")
+    # insert rows
+    for _, r in df.iterrows():
+        serial = int(r["S.NO."]) if not pd.isna(r["S.NO."]) else None
+        name = str(r["Names"]).strip()
+        qty = float(r["Quantity"]) if not pd.isna(r["Quantity"]) else 0.0
+        unit = str(r["Units"]).strip() if "Units" in r and not pd.isna(r["Units"]) else ""
+        issued_total = float(r["Q.Issued"]) if not pd.isna(r["Q.Issued"]) else 0.0
+        remaining = float(r["Q.Remaining"]) if not pd.isna(r["Q.Remaining"]) else qty - issued_total if qty else 0.0
+        cas = str(r["CAS.No."]).strip() if not pd.isna(r["CAS.No."]) else ""
+        # upsert
+        cur.execute("""
+            INSERT INTO chemicals(serial_no,chemical,amount_total,amount_remaining,issued_total,unit,cas_no)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(chemical) DO UPDATE SET
+                serial_no=excluded.serial_no,
+                amount_total=excluded.amount_total,
+                amount_remaining=excluded.amount_remaining,
+                issued_total=excluded.issued_total,
+                unit=excluded.unit,
+                cas_no=excluded.cas_no
+        """, (serial, name, qty, remaining, issued_total, unit, cas))
+    conn.commit()
+    conn.close()
+    return True
 
-# ----------------------------
-# Main App
-# ----------------------------
+# -------------------------
+# Requests and issuance
+# -------------------------
+def create_request(username, chemical, amount, note=""):
+    now = datetime.utcnow().isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
 
-def user_panel(username):
-    st.header("🔹 Request Chemical")
+    # Check master list if chemical exists and enforce amount <= remaining
+    cur.execute("SELECT amount_remaining FROM chemicals WHERE chemical = ?", (chemical,))
+    r = cur.fetchone()
+    if r:
+        amt_remain = r[0]
+        if float(amount) > float(amt_remain):
+            conn.close()
+            return False, f"Requested amount ({amount}) exceeds remaining stock ({amt_remain})."
+    # create request
+    cur.execute("""INSERT INTO requests(username,chemical,amount,note,status,created_at,updated_at)
+                   VALUES (?,?,?,?, 'Pending',?,?)""", (username, chemical, float(amount), note, now, now))
+    conn.commit()
+    conn.close()
+    return True, "Request created"
 
-    chem = st.text_input("Chemical Name")
-    amount = st.number_input("Amount Required", min_value=0.01)
+def list_requests(filters=None):
+    # filters is dict where keys match column names
+    base = "SELECT id,username,chemical,amount,note,status,supervisor,lab_incharge,created_at,updated_at FROM requests"
+    params = []
+    if filters:
+        clauses = []
+        for k, v in filters.items():
+            clauses.append(f"{k} = ?")
+            params.append(v)
+        base += " WHERE " + " AND ".join(clauses)
+    base += " ORDER BY created_at DESC"
+    return safe_query_df(base, params)
 
-    if st.button("Submit Request"):
-        add_request(username, chem, amount)
-        st.success("Request Submitted!")
-
-    st.subheader("Your Chemical Request History")
-    df = load_user_requests(username)
-    st.dataframe(df)
-
-
-def supervisor_panel():
-    st.header("📌 Supervisor Panel")
-
-    st.subheader("Pending Requests")
-    df = load_requests()
-    pending = df[df["status"] == "Pending"]
-    st.dataframe(pending)
-
-    req_id = st.number_input("Enter Request ID to Approve", min_value=1)
-    if st.button("Approve"):
-        approve_request(req_id)
-        st.success("Request Approved!")
-
-    st.subheader("Chemical List")
-    st.dataframe(load_chemical_list())
-
-    if st.button("Download Chemical List"):
-        st.download_button("Download", load_chemical_list().to_csv(), "chemical_list.csv")
-
-    if st.button("Download Issuance Log"):
-        st.download_button("Download", load_requests().to_csv(), "issued_log.csv")
-
-
-def lab_incharge_panel():
-    st.header("🧪 Lab Incharge Panel")
-
-    st.subheader("Approved Requests (Pending Issuance)")
-    df = load_requests()
-    approved = df[df["status"] == "Approved"]
-    st.dataframe(approved)
-
-    req_id = st.number_input("Request ID for Issuing", min_value=1)
-    chemical = st.text_input("Chemical Name for Issuing")
-    amount = st.number_input("Amount to Issue", min_value=0.01)
-
-    if st.button("Issue Chemical"):
-        issue_request(req_id, chemical, amount)
-        st.success("Chemical Issued!")
-
-    st.subheader("Chemical List (Private)")
-    st.dataframe(load_chemical_list())
-
-    st.subheader("Upload New Chemical List")
-    file = st.file_uploader("Upload Excel File", type=["xlsx"])
-    if file:
-        upload_chemical_list(file)
-
-    if st.button("Delete Current Chemical List"):
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM chemicals")
+def update_request_status(rid, status, supervisor=None, lab_incharge=None):
+    now = datetime.utcnow().isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT status, username, chemical, amount FROM requests WHERE id = ?", (rid,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False, "Request not found"
+    old_status, req_user, chem, amt = row
+    if status == "Approved":
+        cur.execute("UPDATE requests SET status=?, supervisor=?, updated_at=? WHERE id=?", (status, supervisor, now, rid))
         conn.commit()
         conn.close()
-        st.warning("Chemical List Deleted Permanently.")
-
-
-# ----------------------------
-# Run App
-# ----------------------------
-
-def main():
-    init_db()
-
-    username, role = login()
-    if not username:
-        st.stop()
-
-    st.sidebar.success(f"Logged in as {username} ({role})")
-
-    if role == "User":
-        user_panel(username)
-    elif role == "Supervisor":
-        supervisor_panel()
-    elif role == "Lab Incharge":
-        lab_incharge_panel()
-
-
-if __name__ == "__main__":
-    main()
+        # notify user and lab_incharge
+        push_notification(req_user, f
